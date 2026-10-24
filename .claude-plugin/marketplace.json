@@ -7,7 +7,7 @@
     {
       "name": "limit-hint",
       "source": "./plugins/limit-hint",
-      "description": "Shows the 5-hour usage limit in the prompt footer (desktop) and hint line (terminal)"
+      "description": "Shows the 5-hour usage limit as a bar above the prompt and in the footer (desktop) and on the hint line (terminal)"
     }
   ],
   "metadata": {

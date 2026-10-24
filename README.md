@@ -8,7 +8,7 @@ Bilal's collection of Claude Code mods. Each mod lives in its own folder under
 
 | Mod | What it does |
 | --- | --- |
-| `limit-hint` | Replaces the hint line under the prompt with your 5-hour usage limit: used, remaining, and time until it resets. |
+| `limit-hint` | Shows your 5-hour usage limit: a full-width progress bar above the prompt and a short figure in the footer on the desktop app, and the hint line in the terminal. |
 
 ## Install
 
