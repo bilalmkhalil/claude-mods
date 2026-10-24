@@ -1,11 +1,16 @@
 {
   "name": "claude-mods",
-  "owner": { "name": "Bilal Khalil Khankhail" },
+  "owner": {
+    "name": "Bilal Khalil Khankhail"
+  },
   "plugins": [
     {
       "name": "limit-hint",
       "source": "./plugins/limit-hint",
-      "description": "Shows the 5-hour usage limit on the hint line under the prompt"
+      "description": "Shows the 5-hour usage limit in the prompt footer (desktop) and hint line (terminal)"
     }
-  ]
+  ],
+  "metadata": {
+    "description": "Claude Code mods by Bilal Khalil Khankhail"
+  }
 }
