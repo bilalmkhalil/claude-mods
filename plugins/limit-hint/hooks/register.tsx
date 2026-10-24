@@ -5,6 +5,8 @@ import type { LimitReading } from '../types'
 
 // The last 5-hour reading. Writing it redraws the footer and the hint line, which read it.
 const reading = atom({ plugin: 'limit-hint', key: 'reading' } as const, null, { shape: 'reading-1' })
+// Whether the band is folded to its title. Kept in the store too, so it stays as left next session.
+const hidden = atom({ plugin: 'limit-hint', key: 'hidden' } as const, false, { shape: 'hidden-1' })
 
 const bar = (percent: number, width: number) => {
   const filled = Math.max(0, Math.min(width, Math.round((percent / 100) * width)))
@@ -78,6 +80,10 @@ const line = (r: LimitReading | null, width: number) => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    void $.store
+      .get('hidden')
+      .then(v => update($, hidden, () => v === true))
+      .catch(() => {})
     void refresh($).catch(() => {})
     // Every 15 seconds: moves the reset countdown, starts the new window on time, and picks up a
     // reading taken elsewhere. Reading it is local: no request is made.
@@ -116,7 +122,9 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' || e.props.hasSurvey) return above
     const r = await read($, reading)
     if (!r) return above
-    const { Box, Svg, Text } = $.ui.resolve(e)
+    const { Box, Button, Svg, Text } = $.ui.resolve(e)
+    const isHidden = await read($, hidden)
+    const fold = (to: boolean) => void update($, hidden, () => to).then(() => $.store.set('hidden', to)).catch(() => {})
     const used = Math.max(0, Math.min(100, r.used))
     const left = Math.max(0, Math.round((100 - r.used) * 10) / 10)
     const reset = until(r.resetsAt, r.at)
@@ -149,10 +157,26 @@ export const register: Register = on => {
               stretch(TRACK_COLOR),
               end('right', TRACK_COLOR),
             ]
-    // The section: its title, then the 5-hour row.
-    const row = (
+    // The title row: the name with Hide or Show right beside it, then a one-line summary while folded.
+    const title = (
+      <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
+        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
+          <Text bold>Limits</Text>
+          <Button key="fold" plain dimColor label={isHidden ? 'Show' : 'Hide'} onPress={() => fold(!isHidden)} />
+        </Box>
+        <Box flexGrow={1} flexShrink={1}>
+          {isHidden ? <Text dimColor>{figures.join('  ·  ')}</Text> : null}
+        </Box>
+      </Box>
+    )
+    // The section: its title, then the 5-hour row unless folded.
+    const row = isHidden ? (
+      <Box flexDirection="column" width="100%" paddingX="sm">
+        {title}
+      </Box>
+    ) : (
       <Box flexDirection="column" width="100%" paddingX="sm" gap="sm">
-        <Text bold>Limits</Text>
+        {title}
         <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
           <Box width={LABEL_WIDTH} flexShrink={0}>
             <Text dimColor>5h limit</Text>

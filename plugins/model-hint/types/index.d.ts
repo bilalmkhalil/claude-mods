@@ -17,6 +17,6 @@ export type Suggestion = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'model-hint': { suggestion: Shaped<Suggestion | null>; mode: Shaped<'rules' | 'haiku'>; confirming: Shaped<boolean>; thinking: Shaped<boolean> }
+    'model-hint': { suggestion: Shaped<Suggestion | null>; mode: Shaped<'rules' | 'haiku'>; confirming: Shaped<boolean>; thinking: Shaped<boolean>; hidden: Shaped<boolean>; visible: Shaped<number> }
   }
 }

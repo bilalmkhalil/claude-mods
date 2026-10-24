@@ -11,6 +11,30 @@ const thinking = atom({ plugin: 'model-hint', key: 'thinking' } as const, false,
 const mode = atom({ plugin: 'model-hint', key: 'mode' } as const, 'rules', { shape: 'mode-1' })
 // True while the band asks to confirm a switch that re-reads a large conversation.
 const confirming = atom({ plugin: 'model-hint', key: 'confirming' } as const, false, { shape: 'confirming-1' })
+// Whether the band is folded to its title. Kept in the store too, so it stays as left next session.
+const hidden = atom({ plugin: 'model-hint', key: 'hidden' } as const, false, { shape: 'hidden-1' })
+// How many of the section's rows show: stepped one at a time toward all or none by Hide and Show,
+// the nearest a band comes to a slide (its height moves in whole rows). ALL means every row.
+const ALL = 99
+const visible = atom({ plugin: 'model-hint', key: 'visible' } as const, ALL, { shape: 'visible-1' })
+// The rows a fold steps through (the most the section draws), and the time per step.
+const FOLD_ROWS = 5
+const FOLD_STEP_MS = 40
+let folding: { cancel: () => void } | undefined
+
+// Folds or unfolds the section a row per step, then settles on none or ALL.
+const fold = async ($: EngineInterface, to: boolean) => {
+  folding?.cancel()
+  await update($, hidden, () => to)
+  void $.store.set('hidden', to).catch(note)
+  let at = Math.min(await read($, visible), FOLD_ROWS)
+  folding = $.clock.every(FOLD_STEP_MS, () => {
+    at += to ? -1 : 1
+    const done = to ? at <= 0 : at >= FOLD_ROWS
+    if (done) folding?.cancel()
+    void update($, visible, () => (done ? (to ? 0 : ALL) : at)).catch(note)
+  })
+}
 
 // A switch starts a new prompt cache, so the next turn re-reads the whole conversation uncached
 // (a cache write, about 1.25x input, where a cached read is about 0.1x). Past WARN tokens Use asks
@@ -381,6 +405,13 @@ const use = async ($: EngineInterface, s: Suggestion) => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
+    void $.store
+      .get('hidden')
+      .then(async v => {
+        await update($, hidden, () => v === true)
+        await update($, visible, () => (v === true ? 0 : ALL))
+      })
+      .catch(note)
     // A reload forgets the last prompt: take it back from the transcript.
     void $.session
       .messages()
@@ -484,20 +515,49 @@ export const register: Register = on => {
     )
     // The section: its title, then its rows. How the prompt is judged has a row of its own.
     const isThinking = await read($, thinking)
+    const isHidden = await read($, hidden)
+    const rowsShown = await read($, visible)
+    const isFolded = rowsShown === 0
+    // What the title row says while folded: the pick in a line. Set below once there is one.
+    let summary = 'type a prompt for a suggestion'
+    // The title row: the name with Hide or Show right beside it, then the summary while folded.
+    const title = () => (
+      <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
+        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
+          <Text bold>Model hints</Text>
+          <Button key="fold" plain dimColor label={isHidden ? 'Show' : 'Hide'} onPress={() => void fold($, !isHidden).catch(note)} />
+        </Box>
+        <Box flexGrow={1} flexShrink={1}>
+          {isFolded ? <Text dimColor>{summary}</Text> : null}
+        </Box>
+      </Box>
+    )
     // The section: its title and rows, Claude at the top right, its mood read off the band.
     // Placed, Claude takes no room, so no row is pushed or cut by it. The desktop paints a placed
     // Box over everything in the flow, whatever the order, so text can't pass over Claude: the
-    // rows beside it (the title and the next two) stop short of it and wrap instead.
+    // rows beside it (the title and the next two) stop short of it and wrap instead. Folded, the
+    // section is its title alone; mid-fold, its first rows. Claude comes on once the section is
+    // tall enough to hold it, so the band never clips it.
     const section = (mood: Mood, ...rows: (RenderElement | null)[]) => {
-      const shown = rows.filter((r): r is RenderElement => r !== null)
+      if (isFolded) {
+        return (
+          <Box flexDirection="column" width="100%" paddingX="sm">
+            {title()}
+          </Box>
+        )
+      }
+      const all = rows.filter((r): r is RenderElement => r !== null)
+      const shown = all.slice(0, rowsShown)
       return (
         <Box position="relative" flexDirection="column" width="100%" paddingX="sm">
-          <Box position="absolute" right={1} top={0}>
-            <Svg source={avatar(mood)} width={AVATAR_W * U} height={AVATAR_H * U} alt={MOOD_ALT[mood]} />
-          </Box>
+          {shown.length >= Math.min(3, all.length) ? (
+            <Box position="absolute" right={1} top={0}>
+              <Svg source={avatar(mood)} width={AVATAR_W * U} height={AVATAR_H * U} alt={MOOD_ALT[mood]} />
+            </Box>
+          ) : null}
           <Box flexDirection="column" width="100%" gap="sm">
             <Box flexDirection="column" paddingRight={AVATAR_CLEAR} gap="sm">
-              <Text bold>Model hints</Text>
+              {title()}
               {shown.slice(0, 2)}
             </Box>
             {shown.slice(2)}
@@ -559,6 +619,7 @@ export const register: Register = on => {
     )
     // Top: the warnings when any, then why. Then one row read left to right: the label, the
     // suggested model and its effort, whether it's in use, and the actions at the end.
+    summary = `${t.name} · ${t.effort} · ${fits ? 'in use' : nowOn ? `you're on ${nowOn}` : 'suggested'}`
     const mood: Mood = isThinking ? 'thinking' : !fits ? 'pointing' : warnings.length ? 'puffed' : 'happy'
     const view = section(
       mood,
