@@ -11,6 +11,36 @@ const bar = (percent: number, width: number) => {
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
+// The bar's height in CSS pixels, about a line of the band's text.
+const TRACK_HEIGHT = 12
+
+const TRACK_COLOR = '#8888884d'
+const fillColor = (used: number) => (used >= 90 ? '#e5484d' : used >= 75 ? '#e5a50a' : '#d97757')
+
+// A straight stretch of one color. The markup is far wider than any band; the slot caps it and
+// stretches it to fit (preserveAspectRatio none), so it has no corners of its own.
+const middle = (color: string) => {
+  const h = TRACK_HEIGHT
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="${h}" viewBox="0 0 4000 ${h}" preserveAspectRatio="none">` +
+    `<rect width="4000" height="${h}" fill="${color}"/>` +
+    '</svg>'
+  )
+}
+
+// A half-round end, drawn at its own size so it stays round however wide the middle is. `behind`
+// fills its corners where it ends inside the track (the fill's right end).
+const cap = (side: 'left' | 'right', color: string, behind?: string) => {
+  const h = TRACK_HEIGHT
+  const r = h / 2
+  return (
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${r}" height="${h}" viewBox="0 0 ${r} ${h}">` +
+    (behind ? `<rect width="${r}" height="${h}" fill="${behind}"/>` : '') +
+    `<rect x="${side === 'left' ? 0 : -r}" width="${h}" height="${h}" rx="${r}" fill="${color}"/>` +
+    '</svg>'
+  )
+}
+
 const until = (iso: string | null, now: number) => {
   if (!iso) return ''
   const ms = Date.parse(iso) - now
@@ -65,20 +95,47 @@ export const register: Register = on => {
     if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
     const r = await read($, reading)
     if (!r) return next(e)
-    const { Box, Text } = $.ui.resolve(e)
+    const { Box, Svg, Text } = $.ui.resolve(e)
     const used = Math.max(0, Math.min(100, r.used))
     const left = Math.max(0, Math.round((100 - r.used) * 10) / 10)
     const reset = until(r.resetsAt, r.at)
-    const fill = used >= 90 ? 'error' : used >= 75 ? 'warning' : 'claude'
+    const figures = [`${r.used}% used`, `${left}% left`, ...(reset ? [reset] : [])]
+    const fill = fillColor(used)
+    // Every piece carries an alt: the surface drops an Svg whose alt is empty.
+    const alt = `${r.used}% of the 5-hour limit used`
+    const end = (side: 'left' | 'right', color: string, behind?: string) => (
+      <Svg source={cap(side, color, behind)} width={TRACK_HEIGHT / 2} height={TRACK_HEIGHT} alt={alt} />
+    )
+    const stretch = (color: string, grow: number) => (
+      <Box flexGrow={grow} flexShrink={1}>
+        <Svg source={middle(color)} height={TRACK_HEIGHT} alt={alt} />
+      </Box>
+    )
+    // The fill is a pill of its own, its right end round over the track; the track runs on after it.
+    // The two stretches split the room by their grow, the fill's share being `used`.
+    const bar =
+      used <= 0
+        ? [end('left', TRACK_COLOR), stretch(TRACK_COLOR, 1), end('right', TRACK_COLOR)]
+        : used >= 100
+          ? [end('left', fill), stretch(fill, 1), end('right', fill)]
+          : [
+              end('left', fill),
+              stretch(fill, used),
+              end('right', fill, TRACK_COLOR),
+              stretch(TRACK_COLOR, 100 - used),
+              end('right', TRACK_COLOR),
+            ]
     return (
-      <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="md">
-        <Text dimColor>5h limit</Text>
-        <Box flexGrow={1} height={1} backgroundColor="promptBorder" overflow="hidden">
-          <Box width={`${used}%`} height={1} backgroundColor={fill} />
+      <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
+        <Box flexShrink={0}>
+          <Text dimColor>5h limit</Text>
         </Box>
-        <Text dimColor wrap="truncate-end">
-          {`${r.used}% used · ${left}% left${reset ? ` · ${reset}` : ''}`}
-        </Text>
+        <Box flexGrow={1} flexShrink={1} minWidth={8} flexDirection="row" alignItems="center">
+          {bar}
+        </Box>
+        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
+          {figures.flatMap((f, i) => (i ? [<Text dimColor>·</Text>, <Text dimColor>{f}</Text>] : [<Text dimColor>{f}</Text>]))}
+        </Box>
       </Box>
     )
   })
