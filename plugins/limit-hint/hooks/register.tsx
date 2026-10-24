@@ -51,15 +51,34 @@ export const register: Register = on => {
     return done
   })
 
-  // Desktop app (Code tab): the footer beside the model name. Other mods' labels are kept after ours.
+  // Desktop app (Code tab): stretches across the footer between the mode and the model name,
+  // as a filled track with the figures beside it. Other mods' labels are kept after ours.
   on('ui.render', { component: 'SessionMode' }, async ($, e, next) => {
     if (e.surface !== 'desktop') return next(e)
     const r = await read($, reading)
     const { Box, Text } = $.ui.resolve(e)
     const below = await next(e)
+    if (!r) {
+      return (
+        <Box flexDirection="row" alignItems="center" flexGrow={1} marginX="lg" gap="md">
+          <Text dimColor wrap="truncate-end">5h limit: no reading yet</Text>
+          {below}
+        </Box>
+      )
+    }
+    const used = Math.max(0, Math.min(100, r.used))
+    const left = Math.max(0, Math.round((100 - r.used) * 10) / 10)
+    const reset = until(r.resetsAt, r.at)
+    const fill = used >= 90 ? 'error' : used >= 75 ? 'warning' : 'claude'
     return (
-      <Box flexDirection="row" alignItems="center" gap={1}>
-        <Text dimColor>{line(r, 8)}</Text>
+      <Box flexDirection="row" alignItems="center" flexGrow={1} marginX="lg" gap="md">
+        <Text dimColor>5h</Text>
+        <Box flexGrow={1} minWidth={8} height={1} backgroundColor="promptBorder" overflow="hidden">
+          <Box width={`${used}%`} height={1} backgroundColor={fill} />
+        </Box>
+        <Text dimColor wrap="truncate-end">
+          {`${r.used}% used · ${left}% left${reset ? ` · ${reset}` : ''}`}
+        </Text>
         {below}
       </Box>
     )
