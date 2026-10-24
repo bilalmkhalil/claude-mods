@@ -1,0 +1,1 @@
+{ "name": "limit-hint", "version": "0.1.0", "description": "Replaces the hint line under the prompt with the 5-hour usage limit: used, remaining and time to reset" }
