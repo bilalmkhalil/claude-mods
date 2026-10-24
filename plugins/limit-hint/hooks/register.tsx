@@ -90,11 +90,14 @@ export const register: Register = on => {
     return next({ ...e, props: { ...e.props, modes: [label, ...e.props.modes] } })
   })
 
-  // Desktop app (Code tab): a full-width band above the prompt with the bar and the figures.
+  // Desktop app (Code tab): a full-width band above the prompt with the bar and the figures. It
+  // draws itself under whatever the plugins beneath it draw there (model-hint's band), so the
+  // two stack in either load order.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.surface !== 'desktop' || e.props.hasSurvey) return next(e)
+    const above = await next(e)
+    if (e.surface !== 'desktop' || e.props.hasSurvey) return above
     const r = await read($, reading)
-    if (!r) return next(e)
+    if (!r) return above
     const { Box, Svg, Text } = $.ui.resolve(e)
     const used = Math.max(0, Math.min(100, r.used))
     const left = Math.max(0, Math.round((100 - r.used) * 10) / 10)
@@ -125,7 +128,7 @@ export const register: Register = on => {
               stretch(TRACK_COLOR, 100 - used),
               end('right', TRACK_COLOR),
             ]
-    return (
+    const row = (
       <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
         <Box flexShrink={0}>
           <Text dimColor>5h limit</Text>
@@ -137,6 +140,14 @@ export const register: Register = on => {
           {figures.flatMap((f, i) => (i ? [<Text dimColor>·</Text>, <Text dimColor>{f}</Text>] : [<Text dimColor>{f}</Text>]))}
         </Box>
       </Box>
+    )
+    return above ? (
+      <Box flexDirection="column" width="100%" gap="sm">
+        {above}
+        {row}
+      </Box>
+    ) : (
+      row
     )
   })
 

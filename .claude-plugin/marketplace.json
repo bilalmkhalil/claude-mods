@@ -8,6 +8,11 @@
       "name": "limit-hint",
       "source": "./plugins/limit-hint",
       "description": "Shows the 5-hour usage limit as a bar above the prompt and in the footer (desktop) and on the hint line (terminal)"
+    },
+    {
+      "name": "model-hint",
+      "source": "./plugins/model-hint",
+      "description": "Suggests a model and effort for the prompt you're writing, in a band above the prompt (desktop), with a button to switch"
     }
   ],
   "metadata": {
