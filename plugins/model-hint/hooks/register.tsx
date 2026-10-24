@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { ConfigRow, EngineInterface, Register } from 'claude-code'
+import type { ConfigRow, EngineInterface, Register, RenderElement } from 'claude-code'
 
 import type { Suggestion } from '../types'
 
@@ -14,6 +14,30 @@ const TIERS = [
   { family: 'opus', name: 'Opus 5.5', effort: 'high', why: 'hard problem' },
   { family: 'opus', name: 'Opus 5.5', effort: 'xhigh', why: 'deep reasoning' },
 ] as const
+
+// The width of the band's label column, in cells; limit-hint's band uses the same so the two line up.
+const LABEL_WIDTH = 10
+
+// Each family's mark: a small spark in its own color.
+const COLORS: Record<string, string> = { haiku: '#4fb39b', sonnet: '#6c9be0', opus: '#d97757' }
+const spark = (family: string) => {
+  const c = COLORS[family] ?? '#999999'
+  const rays = [0, 45, 90, 135]
+    .map(a => `<rect x="6.1" y="0.5" width="1.8" height="13" rx="0.9" fill="${c}" transform="rotate(${a} 7 7)"/>`)
+    .join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">${rays}</svg>`
+}
+
+// Effort as four rising bars, lit up to its level.
+const LEVELS = ['low', 'medium', 'high', 'xhigh']
+const gauge = (effort: string) => {
+  const lit = LEVELS.indexOf(effort) + 1
+  const bars = LEVELS.map((_, i) => {
+    const h = 4 + i * 3
+    return `<rect x="${i * 5}" y="${14 - h}" width="3" height="${h}" rx="1" fill="${i < lit ? '#b8b8b8' : '#8888884d'}"/>`
+  }).join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="14" viewBox="0 0 18 14">${bars}</svg>`
+}
 
 const LIGHT = /\b(rename|typo|format|lint|explain|what is|what's|list|show me|print|bump|comment|spelling|wording)\b/i
 const HEAVY = [
@@ -68,6 +92,12 @@ const effortValue = (row: ConfigRow, effort: string) =>
 let draft = ''
 let lastSent = ''
 let pending: { cancel: () => void } | undefined
+// What last went wrong working out a suggestion, for /model-hint.
+let lastError = ''
+
+const note = (err: unknown) => {
+  lastError = err instanceof Error ? err.message : String(err)
+}
 
 const recompute = async ($: EngineInterface) => {
   const text = draft.trim() || lastSent.trim()
@@ -75,11 +105,19 @@ const recompute = async ($: EngineInterface) => {
     await update($, suggestion, () => null)
     return
   }
-  const [{ rateLimits, context }, model, rows] = await Promise.all([
-    $.session.usage(),
-    $.session.model(),
-    $.config.list(),
+  // Each read stands alone: a host without one (the desktop may keep /config to itself) still
+  // gets a suggestion, just without what that read adds.
+  const skip = (what: string) => (err: unknown) => {
+    lastError = `${what}: ${err instanceof Error ? err.message : String(err)}`
+    return undefined
+  }
+  const [usage, model, rows] = await Promise.all([
+    $.session.usage().catch(skip('usage')),
+    $.session.model().catch(skip('model')),
+    $.config.list().catch(skip('config')),
   ])
+  const rateLimits = usage?.rateLimits ?? []
+  const context = usage?.context ?? { window: 0 }
   let { tier, reasons } = score(text)
   const why = [TIERS[tier]!.why, ...reasons]
 
@@ -97,18 +135,18 @@ const recompute = async ($: EngineInterface) => {
     why.push(`context ${fill}% full · /compact helps`)
   }
 
-  const modelRow = find(rows, /^model$|\bmodel\b/i)
-  const effortRow = find(rows, /effort/i)
+  const modelRow = find(rows ?? [], /^model$|\bmodel\b/i)
+  const effortRow = find(rows ?? [], /effort/i)
   const effort = effortRow && typeof effortRow.value === 'string' ? effortRow.value : null
   const canApply = settable(modelRow) && settable(effortRow)
-  const next: Suggestion = { tier, reasons: why, current: { model, effort }, canApply }
+  const next: Suggestion = { tier, reasons: why, current: { model: model ?? '', effort }, canApply }
   await update($, suggestion, () => next)
 }
 
 // Typing comes in bursts: work it out once the person pauses.
 const schedule = ($: EngineInterface) => {
   pending?.cancel()
-  pending = $.clock.after(300, () => void recompute($).catch(() => {}))
+  pending = $.clock.after(300, () => void recompute($).catch(note))
 }
 
 const apply = async ($: EngineInterface, tier: number) => {
@@ -130,9 +168,17 @@ const apply = async ($: EngineInterface, tier: number) => {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    void recompute($).catch(() => {})
+    // A reload forgets the last prompt: take it back from the transcript.
+    void $.session
+      .messages()
+      .then(ms => {
+        lastSent = ms.findLast(m => m.role === 'user' && !m.toolResults?.length && m.text.trim())?.text ?? ''
+        return recompute($)
+      })
+      .catch(note)
     // The limits and the context move between turns too.
-    $.clock.every(60_000, () => void recompute($).catch(() => {}))
+    $.clock.every(60_000, () => void recompute($).catch(note))
+    await $.command.register({ name: 'model-hint', description: 'Show what model-hint sees: the model and effort settings it would switch' })
     return next(e)
   })
 
@@ -158,24 +204,25 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    await recompute($).catch(() => {})
+    await recompute($).catch(note)
     return done
   })
 
   // Says what the mod sees, to check the Use button can work here.
-  on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'model-hint', description: 'Show what model-hint sees: the model and effort settings it would switch' })
-    return next(e)
-  })
   on('command.run', { command: 'model-hint' }, async $ => {
-    const rows = await $.config.list()
+    const rows = await $.config.list().catch(err => {
+      lastError = `config: ${err instanceof Error ? err.message : String(err)}`
+      return []
+    })
     const show = (r: ConfigRow | undefined) =>
       r ? `${r.key} (${r.kind}${r.isLocked ? ', locked' : ''}) = ${JSON.stringify(r.value)}${r.options ? ` · options ${r.options.join(', ')}` : ''}` : 'not found'
     return {
       text: [
-        `session model: ${await $.session.model()}`,
+        `session model: ${await $.session.model().catch(() => 'unknown')}`,
         `model row: ${show(find(rows, /^model$|\bmodel\b/i))}`,
         `effort row: ${show(find(rows, /effort/i))}`,
+        `draft seen: ${JSON.stringify(draft.slice(0, 60))} · last sent: ${JSON.stringify(lastSent.slice(0, 60))}`,
+        `last error: ${lastError || 'none'}`,
       ].join('\n'),
     }
   })
@@ -186,20 +233,49 @@ export const register: Register = on => {
     const below = await next(e)
     if (e.surface !== 'desktop' || e.props.hasSurvey) return below
     const s = await read($, suggestion)
-    if (!s) return below
-    const { Box, Button, Text } = $.ui.resolve(e)
+    const { Box, Button, Svg, Text } = $.ui.resolve(e)
+    const stack = (row: RenderElement) =>
+      below ? (
+        <Box flexDirection="column" gap="sm">
+          {row}
+          {below}
+        </Box>
+      ) : (
+        row
+      )
+    if (!s) {
+      return stack(
+        <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
+          <Box width={LABEL_WIDTH} flexShrink={0}>
+            <Text dimColor>Model</Text>
+          </Box>
+          <Text dimColor>type a prompt for a suggestion</Text>
+        </Box>,
+      )
+    }
     const t = TIERS[s.tier]!
-    const fits = s.current.model.toLowerCase().includes(t.family) && (s.current.effort ?? '').toLowerCase() === t.effort
+    // The effort is the app's to show where no setting reports it: then the model alone decides.
+    const fits =
+      s.current.model.toLowerCase().includes(t.family) &&
+      (s.current.effort === null || s.current.effort.toLowerCase() === t.effort)
+    // Left: label, the model's mark and name, the effort gauge and word. Right: why, then Use.
     const row = (
       <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
-        <Box flexShrink={0}>
-          <Text dimColor>{fits ? '✓ fits' : 'Suggested'}</Text>
+        <Box width={LABEL_WIDTH} flexShrink={0}>
+          <Text dimColor>{fits ? 'Model ✓' : 'Suggested'}</Text>
         </Box>
-        <Box flexShrink={0}>
-          <Text>{`${t.name} · ${t.effort}`}</Text>
+        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
+          <Svg source={spark(t.family)} width={14} height={14} alt={t.name} />
+          <Text bold>{t.name}</Text>
         </Box>
-        <Box flexGrow={1} flexShrink={1}>
-          <Text dimColor wrap="truncate-end">{s.reasons.join('  ·  ')}</Text>
+        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
+          <Svg source={gauge(t.effort)} width={18} height={14} alt={`${t.effort} effort`} />
+          <Text dimColor>{t.effort}</Text>
+        </Box>
+        <Box flexGrow={1} flexShrink={1} flexDirection="row" justifyContent="flex-end" alignItems="center" gap="md">
+          {s.reasons.flatMap((f, i) =>
+            i ? [<Text dimColor>·</Text>, <Text dimColor wrap="truncate-end">{f}</Text>] : [<Text dimColor wrap="truncate-end">{f}</Text>],
+          )}
         </Box>
         {s.canApply && !fits ? (
           <Box flexShrink={0}>
@@ -208,13 +284,6 @@ export const register: Register = on => {
         ) : null}
       </Box>
     )
-    return below ? (
-      <Box flexDirection="column" width="100%" gap="sm">
-        {row}
-        {below}
-      </Box>
-    ) : (
-      row
-    )
+    return stack(row)
   })
 }

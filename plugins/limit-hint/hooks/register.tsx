@@ -11,6 +11,9 @@ const bar = (percent: number, width: number) => {
   return '█'.repeat(filled) + '░'.repeat(width - filled)
 }
 
+// The width of the band's label column, in cells; model-hint's band uses the same so the two line up.
+const LABEL_WIDTH = 10
+
 // The bar's height in CSS pixels, about a line of the band's text.
 const TRACK_HEIGHT = 12
 
@@ -130,7 +133,7 @@ export const register: Register = on => {
             ]
     const row = (
       <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
-        <Box flexShrink={0}>
+        <Box width={LABEL_WIDTH} flexShrink={0}>
           <Text dimColor>5h limit</Text>
         </Box>
         <Box flexGrow={1} flexShrink={1} minWidth={8} flexDirection="row" alignItems="center">
@@ -142,7 +145,7 @@ export const register: Register = on => {
       </Box>
     )
     return above ? (
-      <Box flexDirection="column" width="100%" gap="sm">
+      <Box flexDirection="column" gap="sm">
         {above}
         {row}
       </Box>
