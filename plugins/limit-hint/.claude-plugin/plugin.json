@@ -1,1 +1,1 @@
-{ "name": "limit-hint", "version": "0.2.0", "description": "Shows the 5-hour usage limit (used, remaining, time to reset) in the prompt footer on the desktop app and on the hint line in the terminal", "author": { "name": "Bilal Khalil Khankhail" } }
+{ "name": "limit-hint", "version": "0.3.0", "description": "Shows the 5-hour usage limit (used, remaining, time to reset) in the prompt footer on the desktop app and on the hint line in the terminal", "author": { "name": "Bilal Khalil Khankhail" }, "types": "./types/index.d.ts" }
