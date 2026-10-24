@@ -4,7 +4,7 @@ import type { ConfigRow, EngineInterface, Register, RenderElement } from 'claude
 import type { Suggestion } from '../types'
 
 // The last suggestion. Writing it redraws the band, which reads it.
-const suggestion = atom({ plugin: 'model-hint', key: 'suggestion' } as const, null, { shape: 'suggestion-4' })
+const suggestion = atom({ plugin: 'model-hint', key: 'suggestion' } as const, null, { shape: 'suggestion-5' })
 // True while Haiku is working out a judgement: the avatar thinks.
 const thinking = atom({ plugin: 'model-hint', key: 'thinking' } as const, false, { shape: 'thinking-1' })
 // How the prompt is judged: by the word rules, or by asking Haiku. The band's switch flips it.
@@ -13,6 +13,11 @@ const mode = atom({ plugin: 'model-hint', key: 'mode' } as const, 'rules', { sha
 const confirming = atom({ plugin: 'model-hint', key: 'confirming' } as const, false, { shape: 'confirming-1' })
 // Whether the band is folded to its title. Kept in the store too, so it stays as left next session.
 const hidden = atom({ plugin: 'model-hint', key: 'hidden' } as const, false, { shape: 'hidden-1' })
+// The tier Use switched this chat to: every main-loop request goes to its model and effort until
+// Reset. The desktop keeps its own picker, which a mod can't move, so this is the switch.
+const chosen = atom({ plugin: 'model-hint', key: 'chosen' } as const, null, { shape: 'chosen-1' })
+// The model and effort the last main-loop request actually went out with: what "in use" means.
+const sent = atom({ plugin: 'model-hint', key: 'sent' } as const, null, { shape: 'sent-1' })
 // How many of the section's rows show: stepped one at a time toward all or none by Hide and Show,
 // the nearest a band comes to a slide (its height moves in whole rows). ALL means every row.
 const ALL = 99
@@ -49,11 +54,11 @@ const familyOf = (model: string) => Object.keys(SPAN).find(f => model.toLowerCas
 
 // Lightest first. `family` is matched against the model row's options and the session's model id.
 const TIERS = [
-  { family: 'haiku', name: 'Haiku 5.5', effort: 'low', why: 'quick task' },
-  { family: 'sonnet', name: 'Sonnet 5.5', effort: 'medium', why: 'everyday coding' },
-  { family: 'opus', name: 'Opus 5.5', effort: 'medium', why: 'multi-file work' },
-  { family: 'opus', name: 'Opus 5.5', effort: 'high', why: 'hard problem' },
-  { family: 'opus', name: 'Opus 5.5', effort: 'xhigh', why: 'deep reasoning' },
+  { family: 'haiku', id: 'claude-haiku-5-5', name: 'Haiku 5.5', effort: 'low', why: 'quick task' },
+  { family: 'sonnet', id: 'claude-sonnet-5-5', name: 'Sonnet 5.5', effort: 'medium', why: 'everyday coding' },
+  { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'medium', why: 'multi-file work' },
+  { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'high', why: 'hard problem' },
+  { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'xhigh', why: 'deep reasoning' },
 ] as const
 
 // The width of the band's label column, in cells; limit-hint's band uses the same so the two line up.
@@ -281,15 +286,6 @@ const askHaiku = async ($: EngineInterface, text: string) => {
 const find = (rows: readonly ConfigRow[], word: RegExp) =>
   rows.find(r => word.test(r.key)) ?? rows.find(r => word.test(r.label))
 
-const settable = (row: ConfigRow | undefined) => !!row && !row.isLocked && (row.kind === 'choice' || row.kind === 'text')
-
-// What the model row takes for a tier: the option naming its family, else the family as an alias.
-const modelValue = (row: ConfigRow, family: string) =>
-  row.options?.find(o => o.toLowerCase().includes(family)) ?? (row.kind === 'text' ? family : undefined)
-
-const effortValue = (row: ConfigRow, effort: string) =>
-  row.options ? row.options.find(o => o.toLowerCase() === effort) : row.kind === 'text' ? effort : undefined
-
 // The draft as last seen, and the last prompt sent: the band falls back to it when the box is empty.
 let draft = ''
 let lastSent = ''
@@ -360,13 +356,26 @@ const recompute = async ($: EngineInterface) => {
     }
   }
 
-  const modelRow = find(rows ?? [], /^model$|\bmodel\b/i)
+  // What runs now: the switch when there is one (it takes the next request), else what the last
+  // request went out with, else the session's own word before any request.
+  const pick = await read($, chosen)
+  const last = await read($, sent)
   const effortRow = find(rows ?? [], /effort/i)
-  const effort = effortRow && typeof effortRow.value === 'string' ? effortRow.value : null
-  // The model alone can be switched where the host has no effort setting.
-  const canApply = settable(modelRow)
+  const current =
+    pick !== null
+      ? { model: TIERS[pick]!.id, effort: TIERS[pick]!.effort as string | null }
+      : last ?? { model: model ?? '', effort: effortRow && typeof effortRow.value === 'string' ? effortRow.value : null }
   const prev = await read($, suggestion)
-  const next: Suggestion = { tier, reasons: why, warnings, current: { model: model ?? '', effort }, canApply, source, contextTokens: tokens }
+  const next: Suggestion = {
+    tier,
+    reasons: why,
+    warnings,
+    current,
+    canApply: true,
+    switched: pick !== null,
+    source,
+    contextTokens: tokens,
+  }
   if (prev?.tier !== tier) await update($, confirming, () => false)
   await update($, suggestion, () => next)
 }
@@ -378,22 +387,21 @@ const schedule = async ($: EngineInterface) => {
   pending = $.clock.after(wait, () => void recompute($).catch(note))
 }
 
+// Switches this chat: from the next request on, its model and effort are the tier's. Nothing is
+// written to settings, so other chats and later sessions keep their own pick.
 const apply = async ($: EngineInterface, tier: number) => {
   const t = TIERS[tier]!
-  const rows = await $.config.list()
-  const modelRow = find(rows, /^model$|\bmodel\b/i)
-  const effortRow = find(rows, /effort/i)
-  const model = modelRow && modelValue(modelRow, t.family)
-  const effort = effortRow && effortValue(effortRow, t.effort)
   await update($, confirming, () => false)
-  if (!modelRow || !model) {
-    $.ui.toast(`Couldn't switch to ${t.name} from here`)
-    return
-  }
-  const a = await $.config.set({ key: modelRow.key, value: model })
-  const b = a.deny || !effortRow || !effort ? a : await $.config.set({ key: effortRow.key, value: effort })
-  if (b.deny) $.ui.toast(`Couldn't switch: ${b.deny}`)
-  else if (!effortRow || !effort) $.ui.toast(`Switched to ${t.name}. Set effort to ${t.effort} in the model picker.`)
+  await update($, chosen, () => tier)
+  $.ui.toast(`Your next message goes to ${t.name} · ${t.effort}. The footer still shows the app's own pick.`)
+  await recompute($)
+}
+
+// Back to the app's own pick from the next request on.
+const reset = async ($: EngineInterface) => {
+  await update($, chosen, () => null)
+  await update($, sent, () => null)
+  $.ui.toast("Your next message goes to the model picked in the app's footer.")
   await recompute($)
 }
 
@@ -424,6 +432,17 @@ export const register: Register = on => {
     $.clock.every(60_000, () => void recompute($).catch(note))
     await $.command.register({ name: 'model-hint', description: 'Show what model-hint sees: the model and effort settings it would switch' })
     return next(e)
+  })
+
+  // Each main-loop request: sent with the switched model and effort when Use set one, and what it
+  // went out with noted, so the band says what really answers. A subagent's requests are its own.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId !== undefined) return yield* next(e)
+    const pick = await read($, chosen)
+    const t = pick !== null ? TIERS[pick] : undefined
+    const out = t ? { ...e, model: t.id, effort: t.effort as typeof e.effort } : e
+    await update($, sent, () => ({ model: out.model, effort: out.effort === undefined ? null : String(out.effort) }))
+    return yield* next(out)
   })
 
   on('prompt.edit', async ($, e, next) => {
@@ -467,6 +486,8 @@ export const register: Register = on => {
         `effort row: ${show(find(rows, /effort/i))}`,
         `draft seen: ${JSON.stringify(draft.slice(0, 60))} · last sent: ${JSON.stringify(lastSent.slice(0, 60))}`,
         `judged by: ${await read($, mode)}`,
+        `switched here to: ${(c => (c === null ? 'nothing (the app picks)' : `${TIERS[c]!.name} · ${TIERS[c]!.effort}`))(await read($, chosen))}`,
+        `last request went out on: ${(l => (l ? `${l.model} · ${l.effort ?? 'no effort'}` : 'none yet'))(await read($, sent))}`,
         `last error: ${lastError || 'none'}`,
       ].join('\n'),
     }
@@ -608,7 +629,7 @@ export const register: Register = on => {
     // What the session runs now, said in words beside the suggestion: in use, or what it is instead.
     const nowOn = TIERS.find(x => s.current.model.toLowerCase().includes(x.family))?.name
     const status = fits ? (
-      <Text>in use</Text>
+      <Text>{s.switched ? 'in use · switched here' : 'in use'}</Text>
     ) : nowOn ? (
       <Text dimColor>{`you're on ${nowOn}`}</Text>
     ) : null
@@ -646,7 +667,9 @@ export const register: Register = on => {
         <Box width={USE_WIDTH} flexShrink={0} flexDirection="row" justifyContent="flex-end">
           {switchable
             ? action(GO, `Switch to ${t.name}`, 'use', `Use ${t.name}`, () => void use($, s).catch(note))
-            : null}
+            : s.switched
+              ? action(SWAP, "Back to the app's pick", 'reset', 'Reset', () => void reset($).catch(note))
+              : null}
         </Box>
       </Box>,
     )
