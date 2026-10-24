@@ -12,13 +12,16 @@ const bar = (percent: number, width: number) => {
 }
 
 // The width of the band's label column, in cells; model-hint's band uses the same so the two line up.
-const LABEL_WIDTH = 10
+const LABEL_WIDTH = 13
 
 // The bar's height in CSS pixels, about a line of the band's text.
 const TRACK_HEIGHT = 12
 
+// The bands keep to three colors: the theme's grays, the accent orange, and amber for a warning.
 const TRACK_COLOR = '#8888884d'
-const fillColor = (used: number) => (used >= 90 ? '#e5484d' : used >= 75 ? '#e5a50a' : '#d97757')
+const ACCENT = '#d97757'
+const WARNING = '#e5a50a'
+const fillColor = (used: number) => (used >= 75 ? WARNING : ACCENT)
 
 // A straight stretch of one color. The markup is far wider than any band; the slot caps it and
 // stretches it to fit (preserveAspectRatio none), so it has no corners of its own.
@@ -54,12 +57,16 @@ const until = (iso: string | null, now: number) => {
 }
 
 // Takes a fresh reading; keeps the last one (with a new clock time) when the engine has none right now.
+// The engine's figures are the last API response's, so once the reset time passes they describe a
+// window that is over: a new one starts empty until the next response says otherwise.
 const refresh = async ($: EngineInterface) => {
   const { rateLimits } = await $.session.usage()
   const five = rateLimits.find(r => r.kind === 'five_hour')
   const at = await $.clock.now()
   const fresh: LimitReading | null = five ? { used: five.percentUsed, resetsAt: five.resetsAt ?? null, at } : null
-  await update($, reading, prev => fresh ?? (prev ? { ...prev, at } : null))
+  const r = fresh ?? (await read($, reading))
+  const over = r?.resetsAt != null && Date.parse(r.resetsAt) <= at
+  await update($, reading, () => (r ? (over ? { used: 0, resetsAt: null, at } : { ...r, at }) : null))
 }
 
 const line = (r: LimitReading | null, width: number) => {
@@ -72,9 +79,17 @@ const line = (r: LimitReading | null, width: number) => {
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     void refresh($).catch(() => {})
-    // Once a minute: moves the reset countdown and picks up a reading taken elsewhere.
-    $.clock.every(60_000, () => void refresh($).catch(() => {}))
+    // Every 15 seconds: moves the reset countdown, starts the new window on time, and picks up a
+    // reading taken elsewhere. Reading it is local: no request is made.
+    $.clock.every(15_000, () => void refresh($).catch(() => {}))
     return next(e)
+  })
+
+  // After every model request, mid-turn included: each response reports the limit.
+  on('turn.step', async function* ($, e, next) {
+    const done = yield* next(e)
+    void refresh($).catch(() => {})
+    return done
   })
 
   // After every reply: the response just reported the limit.
@@ -112,35 +127,42 @@ export const register: Register = on => {
     const end = (side: 'left' | 'right', color: string, behind?: string) => (
       <Svg source={cap(side, color, behind)} width={TRACK_HEIGHT / 2} height={TRACK_HEIGHT} alt={alt} />
     )
-    const stretch = (color: string, grow: number) => (
-      <Box flexGrow={grow} flexShrink={1}>
+    const stretch = (color: string) => (
+      <Box flexGrow={1} flexShrink={1}>
         <Svg source={middle(color)} height={TRACK_HEIGHT} alt={alt} />
       </Box>
     )
-    // The fill is a pill of its own, its right end round over the track; the track runs on after it.
-    // The two stretches split the room by their grow, the fill's share being `used`.
+    // The fill is a pill of its own: its two round ends at their own size, and between them a
+    // stretch exactly `used` percent of the bar wide; the track takes the rest. The ends sit
+    // outside that share, so a small figure is still a whole pill, never a clipped one.
     const bar =
       used <= 0
-        ? [end('left', TRACK_COLOR), stretch(TRACK_COLOR, 1), end('right', TRACK_COLOR)]
+        ? [end('left', TRACK_COLOR), stretch(TRACK_COLOR), end('right', TRACK_COLOR)]
         : used >= 100
-          ? [end('left', fill), stretch(fill, 1), end('right', fill)]
+          ? [end('left', fill), stretch(fill), end('right', fill)]
           : [
               end('left', fill),
-              stretch(fill, used),
+              <Box width={`${used}%`} flexShrink={0}>
+                <Svg source={middle(fill)} height={TRACK_HEIGHT} alt={alt} />
+              </Box>,
               end('right', fill, TRACK_COLOR),
-              stretch(TRACK_COLOR, 100 - used),
+              stretch(TRACK_COLOR),
               end('right', TRACK_COLOR),
             ]
+    // The section: its title, then the 5-hour row.
     const row = (
-      <Box flexDirection="row" alignItems="center" width="100%" paddingX="sm" gap="lg">
-        <Box width={LABEL_WIDTH} flexShrink={0}>
-          <Text dimColor>5h limit</Text>
-        </Box>
-        <Box flexGrow={1} flexShrink={1} minWidth={8} flexDirection="row" alignItems="center">
-          {bar}
-        </Box>
-        <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
-          {figures.flatMap((f, i) => (i ? [<Text dimColor>·</Text>, <Text dimColor>{f}</Text>] : [<Text dimColor>{f}</Text>]))}
+      <Box flexDirection="column" width="100%" paddingX="sm" gap="sm">
+        <Text bold>Limits</Text>
+        <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
+          <Box width={LABEL_WIDTH} flexShrink={0}>
+            <Text dimColor>5h limit</Text>
+          </Box>
+          <Box flexGrow={1} flexShrink={1} minWidth={8} flexDirection="row" alignItems="center">
+            {bar}
+          </Box>
+          <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
+            {figures.flatMap((f, i) => (i ? [<Text dimColor>·</Text>, <Text dimColor>{f}</Text>] : [<Text dimColor>{f}</Text>]))}
+          </Box>
         </Box>
       </Box>
     )

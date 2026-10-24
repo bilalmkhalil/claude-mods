@@ -9,7 +9,7 @@ Bilal's collection of Claude Code mods. Each mod lives in its own folder under
 | Mod | What it does |
 | --- | --- |
 | `limit-hint` | Shows your 5-hour usage limit: a full-width progress bar above the prompt and a short figure in the footer on the desktop app, and the hint line in the terminal. |
-| `model-hint` | Suggests a model and effort for the prompt you're writing, from its wording and size, your usage limits and how full the context is. Shown in a band above the limit band on the desktop app, with a Use button to switch. |
+| `model-hint` | Suggests a model and effort for the prompt you're writing, judged by word rules or by Haiku (a small request per new prompt), adjusted for your usage limits and how full the context is. Shown on the desktop app in a "Model hints" band above the limit band, with an animated pixel Claude whose mood follows the band, and a Use button that warns before a switch that would re-read a long chat. |
 
 ## Install
 
