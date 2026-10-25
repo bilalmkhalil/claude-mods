@@ -1,23 +1,21 @@
 import { atom, read, update } from 'claude-code'
 import type { ConfigRow, EngineInterface, Register, RenderElement } from 'claude-code'
 
-import type { Suggestion } from '../types'
+import type { Mix, Suggestion } from '../types'
 
 // The last suggestion. Writing it redraws the band, which reads it.
-const suggestion = atom({ plugin: 'model-hint', key: 'suggestion' } as const, null, { shape: 'suggestion-5' })
+const suggestion = atom({ plugin: 'model-hint', key: 'suggestion' } as const, null, { shape: 'suggestion-8' })
 // True while Haiku is working out a judgement: the avatar thinks.
 const thinking = atom({ plugin: 'model-hint', key: 'thinking' } as const, false, { shape: 'thinking-1' })
 // How the prompt is judged: by the word rules, or by asking Haiku. The band's switch flips it.
 const mode = atom({ plugin: 'model-hint', key: 'mode' } as const, 'rules', { shape: 'mode-1' })
-// True while the band asks to confirm a switch that re-reads a large conversation.
-const confirming = atom({ plugin: 'model-hint', key: 'confirming' } as const, false, { shape: 'confirming-1' })
 // Whether the band is folded to its title. Kept in the store too, so it stays as left next session.
 const hidden = atom({ plugin: 'model-hint', key: 'hidden' } as const, false, { shape: 'hidden-1' })
-// The tier Use switched this chat to: every main-loop request goes to its model and effort until
-// Reset. The desktop keeps its own picker, which a mod can't move, so this is the switch.
-const chosen = atom({ plugin: 'model-hint', key: 'chosen' } as const, null, { shape: 'chosen-1' })
-// The model and effort the last main-loop request actually went out with: what "in use" means.
-const sent = atom({ plugin: 'model-hint', key: 'sent' } as const, null, { shape: 'sent-1' })
+// The model and effort the chat runs on, kept live: the footer's picker as the engine reports a
+// switch, the settings, and each request as it goes. The person picks; the band only advises.
+const running = atom({ plugin: 'model-hint', key: 'running' } as const, null, { shape: 'running-1' })
+// This chat's tokens per message, averaged over its last few: what a model's price is put to.
+const perMessage = atom({ plugin: 'model-hint', key: 'perMessage' } as const, null, { shape: 'per-message-1' })
 // How many of the section's rows show: stepped one at a time toward all or none by Hide and Show,
 // the nearest a band comes to a slide (its height moves in whole rows). ALL means every row.
 const ALL = 99
@@ -41,16 +39,54 @@ const fold = async ($: EngineInterface, to: boolean) => {
   })
 }
 
-// A switch starts a new prompt cache, so the next turn re-reads the whole conversation uncached
-// (a cache write, about 1.25x input, where a cached read is about 0.1x). Past WARN tokens Use asks
-// first; past HOLD a switch is only suggested when it moves two tiers or more.
-const REREAD_WARN = 20_000
-const REREAD_HOLD = 60_000
 const kTokens = (n: number) => `${Math.round(n / 1000)}k`
+const dollars = (n: number) => (n >= 0.01 ? `$${n.toFixed(2)}` : '<$0.01')
 
-// Where a model family sits among the tiers: the lightest tier it serves, and its heaviest.
-const SPAN: Record<string, [number, number]> = { haiku: [0, 0], sonnet: [1, 1], opus: [2, 4] }
-const familyOf = (model: string) => Object.keys(SPAN).find(f => model.toLowerCase().includes(f))
+// API list prices, $ per million tokens: uncached input, output, cache read. Haiku's rise past 100k
+// tokens of prompt; its cache read is taken as a tenth of input. A cache write costs 1.25x input
+// for a 5-minute cache, 2x for an hour's. A plan's usage limit draws on the same mix, so the
+// ratios hold for a plan as the dollars do for credits.
+type Price = { input: number; output: number; read: number; write: number }
+type Ttl = '5m' | '1h'
+const TTL_MS: Record<Ttl, number> = { '5m': 5 * 60_000, '1h': 60 * 60_000 }
+const BASE: Record<string, (prompt: number) => Omit<Price, 'write'>> = {
+  opus: () => ({ input: 4, output: 20, read: 0.2 }),
+  sonnet: () => ({ input: 2, output: 10, read: 0.2 }),
+  haiku: prompt => (prompt > 100_000 ? { input: 0.5, output: 2.5, read: 0.05 } : { input: 0.1, output: 0.5, read: 0.01 }),
+}
+const priceOf = (family: string, prompt: number, ttl: Ttl): Price => {
+  const b = BASE[family]!(prompt)
+  return { ...b, write: b.input * (ttl === '1h' ? 2 : 1.25) }
+}
+const familyOf = (model: string) => Object.keys(BASE).find(f => model.toLowerCase().includes(f))
+
+// What one message of this chat costs on a family, its tokens as measured.
+const costOf = (family: string, mix: Mix, prompt: number, ttl: Ttl) => {
+  const p = priceOf(family, prompt, ttl)
+  return (mix.input * p.input + mix.output * p.output + mix.cacheRead * p.read + mix.cacheWrite * p.write) / 1e6
+}
+
+// What moving to a family costs once: its cache is the model's own, so the next message writes
+// what that cache lacks where it would have read it. A model that answered within the cache's
+// lifetime still holds the chat up to then, so going back to it re-reads only what came after.
+const switchCostOf = (family: string, tokens: number, ttl: Ttl, at: number) => {
+  const p = priceOf(family, tokens, ttl)
+  const w = warm.get(family)
+  const isWarm = !!w && at - w.at < TTL_MS[ttl]
+  const lacks = isWarm ? Math.max(0, tokens - w.tokens) : tokens
+  return { cost: (lacks * (p.write - p.read)) / 1e6, lacks, warmMinutes: isWarm ? Math.round((at - w.at) / 60_000) : null }
+}
+
+// A cheaper model is worth moving to only when the saving repays the switch within this many
+// messages: past that, the next prompt may want another model and a switch again.
+const HORIZON = 3
+
+// Where a family sits among the tiers: the lightest tier it serves, and its heaviest.
+const SPAN: Record<string, [number, number]> = { haiku: [0, 0], sonnet: [1, 1], opus: [2, 5] }
+
+// A message's tokens before any is measured: the chat read twice from cache (a reply and a tool
+// round), with a typical reply and what it adds.
+const guessMix = (tokens: number): Mix => ({ input: 500, output: 1500, cacheRead: tokens * 2, cacheWrite: 2500 })
 
 // Lightest first. `family` is matched against the model row's options and the session's model id.
 const TIERS = [
@@ -59,6 +95,7 @@ const TIERS = [
   { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'medium', why: 'multi-file work' },
   { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'high', why: 'hard problem' },
   { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'xhigh', why: 'deep reasoning' },
+  { family: 'opus', id: 'claude-opus-5-5', name: 'Opus 5.5', effort: 'max', why: 'the hardest problem' },
 ] as const
 
 // The width of the band's label column, in cells; limit-hint's band uses the same so the two line up.
@@ -66,12 +103,10 @@ const LABEL_WIDTH = 13
 
 // The model row's slots, in cells, each as wide as its longest content: the row reads the same,
 // nothing sliding along, whichever model, effort or state it shows, and with or without Use.
-const NAME_WIDTH = 11
-const EFFORT_WIDTH = 10
-const STATUS_WIDTH = 21
-const USE_WIDTH = 20
+const NAME_WIDTH = 15
+const EFFORT_WIDTH = 17
 
-// The bands keep to three colors: the theme's grays, the accent orange, and amber for a warning.
+// The bands keep to the theme's grays and the accent orange; only the effort gauge adds amber and red.
 const ACCENT = '#d97757'
 
 // The model's mark: a small spark in the accent.
@@ -83,15 +118,10 @@ const spark = () => {
   return `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14">${rays}</svg>`
 }
 
-// The actions' marks, the size of the model's and the effort's. Swap: two arrows passing, in
-// gray, for how the prompt is judged. Go: an arrow in the accent, for Use.
+// The judging switch's mark, the size of the model's and the effort's: two arrows passing, in gray.
 const SWAP =
   '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#c8c8c8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">' +
   '<path d="M1.5 4.5h10M9 2l2.5 2.5L9 7"/><path d="M12.5 9.5h-10M5 7L2.5 9.5 5 12"/></svg>'
-const GO =
-  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="#d97757" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">' +
-  '<path d="M2 7h10M8 3l4 4-4 4"/></svg>'
-
 // Claude, in pixels, behind the hints at the right: drawn to the welcome screen's figure (a body
 // 12 by 6, arms 2 wide at its middle, eyes 1 by 2, four legs), its pose and what floats around it
 // saying how the band reads.
@@ -188,15 +218,30 @@ const MOOD_ALT: Record<Mood, string> = {
   curious: 'Claude asking before a switch',
 }
 
-// Effort as four rising bars, lit up to its level.
-const LEVELS = ['low', 'medium', 'high', 'xhigh']
+// Effort as six rising bars, one per option of the desktop's picker (the API's five levels, then
+// Ultracode, which goes out as xhigh with the app's Ultracode mode on), lit up to its level in the
+// level's color: gray for the everyday two, then the accent, amber, red and violet.
+const LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultracode']
+const LEVEL_COLORS: Record<string, string> = {
+  low: '#c8c8c8',
+  medium: '#c8c8c8',
+  high: ACCENT,
+  xhigh: '#e5a50a',
+  max: '#e5484d',
+  ultracode: '#a78bfa',
+}
+// What the picker calls each level.
+const LEVEL_NAMES: Record<string, string> = { low: 'Low', medium: 'Medium', high: 'High', xhigh: 'Extra high', max: 'Max', ultracode: 'Ultracode' }
+const levelName = (effort: string) => LEVEL_NAMES[effort] ?? effort
+const GAUGE_W = 28
 const gauge = (effort: string) => {
   const lit = LEVELS.indexOf(effort) + 1
+  const on = LEVEL_COLORS[effort] ?? '#c8c8c8'
   const bars = LEVELS.map((_, i) => {
-    const h = 4 + i * 3
-    return `<rect x="${i * 5}" y="${14 - h}" width="3" height="${h}" rx="1" fill="${i < lit ? '#c8c8c8' : '#88888873'}"/>`
+    const h = 4 + i * 2
+    return `<rect x="${i * 5}" y="${14 - h}" width="3" height="${h}" rx="1" fill="${i < lit ? on : '#88888873'}"/>`
   }).join('')
-  return `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="14" viewBox="0 0 18 14">${bars}</svg>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${GAUGE_W}" height="14" viewBox="0 0 ${GAUGE_W} 14">${bars}</svg>`
 }
 
 const LIGHT = /\b(rename|typo|format|lint|explain|what is|what's|list|show me|print|bump|comment|spelling|wording)\b/i
@@ -239,12 +284,13 @@ const score = (text: string) => {
 // Haiku's judgement of a prompt, as a tier and a few words why; undefined when it gave none.
 const HAIKU_SYSTEM = [
   'You pick the Claude model and reasoning effort a coding request needs. Reply with JSON only:',
-  '{"tier": <0-4>, "why": "<at most 5 words>"}',
+  '{"tier": <0-5>, "why": "<at most 5 words>"}',
   'Tiers: 0 = Haiku, low effort: trivial edits, lookups, one-line answers.',
   '1 = Sonnet, medium: everyday coding, a focused change, a clear question.',
   '2 = Opus, medium: multi-file changes, unfamiliar code, careful debugging.',
   '3 = Opus, high: hard bugs, design and architecture, plans with trade-offs.',
-  '4 = Opus, xhigh: the hardest problems: deep concurrency, security, large redesigns.',
+  '4 = Opus, xhigh: very hard problems: deep concurrency, security, large redesigns.',
+  '5 = Opus, max: the hardest, where correctness matters more than cost.',
   'Judge what the request asks, not its length or the words it uses.',
 ].join('\n')
 
@@ -286,41 +332,76 @@ const askHaiku = async ($: EngineInterface, text: string) => {
 const find = (rows: readonly ConfigRow[], word: RegExp) =>
   rows.find(r => word.test(r.key)) ?? rows.find(r => word.test(r.label))
 
-// The draft as last seen, and the last prompt sent: the band falls back to it when the box is empty.
+// The draft as last seen: what the band judges. Empty, the band shows the model in use.
 let draft = ''
-let lastSent = ''
 let pending: { cancel: () => void } | undefined
 // What last went wrong working out a suggestion, for /model-hint.
 let lastError = ''
+// Each turn's tokens as its requests come back, and the last few finished turns'.
+const turnMix = new Map<string, Mix>()
+const RECENT = 5
+let recent: Mix[] = []
+// When each model family last answered, and the chat's size then: what its cache still holds.
+const warm = new Map<string, { at: number; tokens: number }>()
+// The cache's lifetime as the engine reported it at a switch; till then, an hour's for a plan's
+// login (Claude Code's own) and five minutes' otherwise.
+let reportedTtl: Ttl | null = null
+// How the account pays: a plan's usage limits, or credits at API prices. Read at session start.
+let identityKind: string | null = null
+let planSeen = false
+// The rows the app last gave the band, its width, and the rows the band worked out it needed.
+let lastFit: { maxRows: number; bodyColumns: number; rows: number } | null = null
+// Whether an effort change mid-chat re-read the cache, as measured: null till one is seen.
+let effortBreaksCache: boolean | null = null
+let lastStep: { model: string; effort: string | null } | null = null
 
 const note = (err: unknown) => {
   lastError = err instanceof Error ? err.message : String(err)
 }
 
 const recompute = async ($: EngineInterface) => {
-  const text = draft.trim() || lastSent.trim()
-  if (!text) {
-    await update($, suggestion, () => null)
-    return
-  }
+  const text = draft.trim()
   // Each read stands alone: a host without one (the desktop may keep /config to itself) still
   // gets a suggestion, just without what that read adds.
   const skip = (what: string) => (err: unknown) => {
     lastError = `${what}: ${err instanceof Error ? err.message : String(err)}`
     return undefined
   }
-  const [usage, model, rows] = await Promise.all([
-    $.session.usage().catch(skip('usage')),
-    $.session.model().catch(skip('model')),
-    $.config.list().catch(skip('config')),
-  ])
+  const usage = await $.session.usage().catch(skip('usage'))
   const rateLimits = usage?.rateLimits ?? []
   const context = usage?.context ?? { window: 0 }
+  const tokens = context.tokens ?? 0
+  const current = (await read($, running)) ?? { model: (await $.session.model().catch(skip('model'))) ?? '', effort: null }
+  const used = Math.max(0, ...rateLimits.filter(r => r.kind === 'five_hour' || r.kind === 'seven_day').map(r => r.percentUsed))
+  // A plan's login pays in usage until its limit runs out; past it, and for credits, in dollars.
+  // A plan shows in its 5-hour and weekly windows where the login doesn't say.
+  const isPlan = identityKind === 'claude.ai' || (identityKind === null && rateLimits.some(r => r.kind === 'five_hour' || r.kind === 'seven_day'))
+  planSeen = isPlan
+  const billing: Suggestion['billing'] = isPlan && used < 100 ? 'plan' : 'credits'
+  const ttl: Ttl = reportedTtl ?? (isPlan ? '1h' : '5m')
+  // An empty prompt box: nothing to judge, so the band shows the model the chat runs now.
+  if (!text) {
+    const idle: Suggestion = {
+      idle: true,
+      tier: 0,
+      advice: 'fits',
+      alt: null,
+      reasons: [],
+      warnings: [],
+      current,
+      source: 'rules',
+      contextTokens: tokens,
+      billing,
+      compare: null,
+    }
+    await update($, suggestion, () => idle)
+    return
+  }
   // Haiku's tier when asked for and it answers, else the word rules'.
   const by = await read($, mode)
   const judgement = by === 'haiku' ? await askHaiku($, text).catch(err => (note(err), undefined)) : undefined
   // A newer pause took over while Haiku answered: let that one write.
-  if (by === 'haiku' && text !== (draft.trim() || lastSent.trim())) return
+  if (by === 'haiku' && text !== draft.trim()) return
   const ruled = score(text)
   let tier = judgement ? judgement.tier : ruled.tier
   const why = judgement ? [judgement.why] : [TIERS[tier]!.why, ...ruled.reasons]
@@ -328,12 +409,13 @@ const recompute = async ($: EngineInterface) => {
   const warnings: string[] = []
   const source: Suggestion['source'] = judgement ? 'haiku' : by === 'haiku' ? 'rules-fallback' : 'rules'
 
-  // Room left in the limits: step down as they fill, and keep xhigh for when there's plenty.
-  const used = Math.max(0, ...rateLimits.filter(r => r.kind === 'five_hour' || r.kind === 'seven_day').map(r => r.percentUsed))
+  // Room left in the limits: step down as they fill; xhigh only under half used, max under a quarter.
   if (used >= 90) tier = Math.max(0, tier - 2)
   else if (used >= 75) tier = Math.max(0, tier - 1)
   else if (used >= 50) tier = Math.min(tier, 3)
-  if (used >= 75) warnings.push(`You've used ${used}% of your limit, so this leans lighter.`)
+  else if (used >= 25) tier = Math.min(tier, 4)
+  if (used >= 75 && used < 100) warnings.push(`You've used ${used}% of your limit, so this leans lighter.`)
+  if (isPlan && used >= 100) warnings.push("You're past your plan's limit, so further usage is billed at API prices.")
 
   // A full context makes every turn costly: think less, and say compacting helps.
   const fill = context.percent ?? 0
@@ -342,41 +424,33 @@ const recompute = async ($: EngineInterface) => {
     warnings.push(`The conversation fills ${fill}% of the context; /compact frees room.`)
   }
 
-  // Deep into a conversation a switch costs a full re-read: stay on the current model unless the
-  // suggestion is two tiers or more from what it serves.
-  const tokens = context.tokens ?? 0
-  const family = familyOf(model ?? '')
-  if (family && tokens >= REREAD_HOLD && TIERS[tier]!.family !== family) {
-    const [lo, hi] = SPAN[family]!
-    const nearest = Math.max(lo, Math.min(hi, tier))
-    if (Math.abs(nearest - tier) < 2) {
-      tier = nearest
-      const name = TIERS.find(x => x.family === family)!.name
-      warnings.push(`Staying on ${name} keeps this chat's ${kTokens(tokens)} tokens cached, cheaper than a switch here.`)
+  // The pick priced against the model the chat runs on, on this chat's own messages: one message
+  // on each, and what moving costs once. A cheaper model that wouldn't repay the move within
+  // HORIZON messages isn't worth it: the band says stay, nearest in effort to what it judged.
+  const measured = await read($, perMessage)
+  const mix = measured ?? guessMix(tokens)
+  const now = familyOf(current.model)
+  const to = TIERS[tier]!.family
+  let advice: Suggestion['advice'] = 'fits'
+  let alt: number | null = null
+  let compare: Suggestion['compare'] = null
+  if (now && now !== to) {
+    const here = costOf(now, mix, tokens, ttl)
+    const there = costOf(to, mix, tokens, ttl)
+    const sw = switchCostOf(to, tokens, ttl, await $.clock.now())
+    const saving = here - there
+    const breakEven = saving > 0 ? Math.max(1, Math.ceil(sw.cost / saving)) : null
+    compare = { here, there, saving, switchCost: sw.cost, breakEven, lacks: sw.lacks, warmMinutes: sw.warmMinutes, isEstimate: !measured }
+    if (saving <= 0) advice = 'upgrade'
+    else if (breakEven !== null && breakEven <= HORIZON) advice = 'switch'
+    else {
+      advice = 'stay'
+      alt = tier
+      const [lo, hi] = SPAN[now]!
+      tier = Math.max(lo, Math.min(hi, tier))
     }
   }
-
-  // What runs now: the switch when there is one (it takes the next request), else what the last
-  // request went out with, else the session's own word before any request.
-  const pick = await read($, chosen)
-  const last = await read($, sent)
-  const effortRow = find(rows ?? [], /effort/i)
-  const current =
-    pick !== null
-      ? { model: TIERS[pick]!.id, effort: TIERS[pick]!.effort as string | null }
-      : last ?? { model: model ?? '', effort: effortRow && typeof effortRow.value === 'string' ? effortRow.value : null }
-  const prev = await read($, suggestion)
-  const next: Suggestion = {
-    tier,
-    reasons: why,
-    warnings,
-    current,
-    canApply: true,
-    switched: pick !== null,
-    source,
-    contextTokens: tokens,
-  }
-  if (prev?.tier !== tier) await update($, confirming, () => false)
+  const next: Suggestion = { idle: false, tier, advice, alt, reasons: why, warnings, current, source, contextTokens: tokens, billing, compare }
   await update($, suggestion, () => next)
 }
 
@@ -387,28 +461,74 @@ const schedule = async ($: EngineInterface) => {
   pending = $.clock.after(wait, () => void recompute($).catch(note))
 }
 
-// Switches this chat: from the next request on, its model and effort are the tier's. Nothing is
-// written to settings, so other chats and later sessions keep their own pick.
-const apply = async ($: EngineInterface, tier: number) => {
-  const t = TIERS[tier]!
-  await update($, confirming, () => false)
-  await update($, chosen, () => tier)
-  $.ui.toast(`Your next message goes to ${t.name} · ${t.effort}. The footer still shows the app's own pick.`)
-  await recompute($)
+// The desktop app's own record of each chat: the picker's model and effort, and whether Ultracode
+// is on, saved the moment the person picks. Found once by this session's id among the app's
+// session files; then read again only when the file changes.
+type Picked = { model: string | null; effort: string | null }
+let desktopFile: string | null = null
+let desktopLookedAt = 0
+let desktopMtime = 0
+let desktopPick: Picked | null = null
+const DESKTOP_BASES = ['.config/Claude/claude-code-sessions', 'Library/Application Support/Claude/claude-code-sessions']
+const findDesktopFile = async ($: EngineInterface) => {
+  const home = $.plugin.root.split(/\/\.claude\/|\/\.config\/|\/Library\//)[0]
+  const id = await $.session.id()
+  for (const base of DESKTOP_BASES.map(b => `${home}/${b}`)) {
+    if (!(await $.fs.exists(base).catch(() => false))) continue
+    for (const a of await $.fs.list(base)) {
+      if (a.kind !== 'dir') continue
+      for (const b of await $.fs.list(`${base}/${a.name}`)) {
+        if (b.kind !== 'dir') continue
+        for (const f of await $.fs.list(`${base}/${a.name}/${b.name}`)) {
+          if (f.kind !== 'file' || !f.name.startsWith('local_') || !f.name.endsWith('.json')) continue
+          const path = `${base}/${a.name}/${b.name}/${f.name}`
+          const text = await $.fs.read(path).catch(() => '')
+          if (new RegExp(`"cliSessionId"\\s*:\\s*"${id}"`).test(text)) return path
+        }
+      }
+    }
+  }
+  return null
+}
+const readDesktop = async ($: EngineInterface): Promise<Picked | null> => {
+  const at = await $.clock.now()
+  // A chat the app hasn't saved yet: look again every half minute.
+  if (!desktopFile && at - desktopLookedAt > 30_000) {
+    desktopLookedAt = at
+    desktopFile = await findDesktopFile($).catch(() => null)
+  }
+  if (!desktopFile) return null
+  const { mtimeMs } = await $.fs.stat(desktopFile)
+  if (mtimeMs === desktopMtime) return desktopPick
+  desktopMtime = mtimeMs
+  const d = JSON.parse(await $.fs.read(desktopFile)) as { model?: unknown; effort?: unknown; sessionSettings?: { ultracode?: unknown } }
+  desktopPick = {
+    model: typeof d.model === 'string' ? d.model : null,
+    effort: d.sessionSettings?.ultracode === true ? 'ultracode' : typeof d.effort === 'string' ? d.effort : null,
+  }
+  return desktopPick
 }
 
-// Back to the app's own pick from the next request on.
-const reset = async ($: EngineInterface) => {
-  await update($, chosen, () => null)
-  await update($, sent, () => null)
-  $.ui.toast("Your next message goes to the model picked in the app's footer.")
-  await recompute($)
-}
-
-// Use: straight to the switch in a short conversation, else ask first with what it re-reads.
-const use = async ($: EngineInterface, s: Suggestion) => {
-  if (s.contextTokens >= REREAD_WARN) await update($, confirming, () => true)
-  else await apply($, s.tier)
+// Reads the picker's model and effort (the desktop's record; elsewhere the session's model and the
+// effort setting) and keeps `running` to them when either moved. Each read is local and the
+// record is parsed only when it changed, so this runs every second.
+let polled: { model: string; effort: string | null } | null = null
+const follow = async ($: EngineInterface) => {
+  const desk = await readDesktop($).catch(() => null)
+  const model = desk?.model ?? (await $.session.model().catch(() => null))
+  const setting = desk ? desk.effort : await $.settings.read({ key: 'effortLevel' }).catch(() => undefined)
+  const effort = typeof setting === 'string' && LEVELS.includes(setting) ? setting : null
+  if (!model || (polled && polled.model === model && polled.effort === effort)) return
+  const was = polled
+  polled = { model, effort }
+  // The first read seeds what nothing else has; after it, whichever of the two moved is the
+  // person's change and wins over what the last request went out with.
+  await update($, running, r =>
+    !was
+      ? (r ?? { model, effort })
+      : { model: was.model !== model ? model : (r?.model ?? model), effort: was.effort !== effort ? effort : (r?.effort ?? effort) },
+  )
+  if (was) await recompute($)
 }
 
 export const register: Register = on => {
@@ -420,29 +540,78 @@ export const register: Register = on => {
         await update($, visible, () => (v === true ? 0 : ALL))
       })
       .catch(note)
-    // A reload forgets the last prompt: take it back from the transcript.
     void $.session
-      .messages()
-      .then(ms => {
-        lastSent = ms.findLast(m => m.role === 'user' && !m.toolResults?.length && m.text.trim())?.text ?? ''
-        return recompute($)
+      .identity()
+      .then(id => {
+        identityKind = 'kind' in id && typeof id.kind === 'string' ? id.kind : null
       })
       .catch(note)
+      .then(() => follow($))
+      .then(() => recompute($))
+      .catch(note)
+    // The picker can move at any time, the prompt box empty or not.
+    $.clock.every(1_000, () => void follow($).catch(note))
     // The limits and the context move between turns too.
     $.clock.every(60_000, () => void recompute($).catch(note))
-    await $.command.register({ name: 'model-hint', description: 'Show what model-hint sees: the model and effort settings it would switch' })
+    await $.command.register({ name: 'model-hint', description: "Show what model-hint sees: the model in use and this chat's tokens per message" })
     return next(e)
   })
 
-  // Each main-loop request: sent with the switched model and effort when Use set one, and what it
-  // went out with noted, so the band says what really answers. A subagent's requests are its own.
+  // Each main-loop request, as it went: the model that answered and the tokens it took, added to
+  // its turn; when its model last answered, for the cache it holds; and, where the effort moved on
+  // the same model, whether that re-read the cache. A subagent's requests are its own.
   on('turn.step', async function* ($, e, next) {
-    if (e.agentId !== undefined) return yield* next(e)
-    const pick = await read($, chosen)
-    const t = pick !== null ? TIERS[pick] : undefined
-    const out = t ? { ...e, model: t.id, effort: t.effort as typeof e.effort } : e
-    await update($, sent, () => ({ model: out.model, effort: out.effort === undefined ? null : String(out.effort) }))
-    return yield* next(out)
+    const done = yield* next(e)
+    if (e.agentId !== undefined || !done.usage) return done
+    const u = done.usage
+    const effort = e.effort === undefined ? null : String(e.effort)
+    // Ultracode goes out as xhigh: the picker's word for it stands.
+    const shown = desktopPick?.effort === 'ultracode' && effort === 'xhigh' ? 'ultracode' : effort
+    await update($, running, () => ({ model: u.model, effort: shown }))
+    const family = familyOf(u.model)
+    if (family) warm.set(family, { at: await $.clock.now(), tokens: u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens })
+    if (lastStep && lastStep.model === u.model && lastStep.effort !== null && effort !== null && lastStep.effort !== effort) {
+      effortBreaksCache = u.cache_creation_input_tokens > u.cache_read_input_tokens
+    }
+    lastStep = { model: u.model, effort }
+    const sum = turnMix.get(e.turnId) ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+    turnMix.set(e.turnId, {
+      input: sum.input + u.input_tokens,
+      output: sum.output + u.output_tokens,
+      cacheRead: sum.cacheRead + u.cache_read_input_tokens,
+      cacheWrite: sum.cacheWrite + u.cache_creation_input_tokens,
+    })
+    return done
+  })
+
+  // The engine's word that the chat's model moved (the footer's picker, /model): the band follows
+  // at once, with the cache lifetime the engine runs on.
+  on('classic.PostModelSwitch', async ($, e, next) => {
+    const done = await next(e)
+    if (e.agent_id === undefined) {
+      reportedTtl = e.cache_ttl
+      await update($, running, r => ({ model: e.to_model, effort: r?.effort ?? null }))
+      await recompute($).catch(note)
+    }
+    return done
+  })
+
+  // An effort set through a settings row (an /effort command, a settings change) shows at once.
+  on('config.set', async ($, e, next) => {
+    const done = await next(e)
+    if (!done.deny && /effort/i.test(e.key) && typeof done.value === 'string' && LEVELS.includes(done.value)) {
+      const effort = done.value
+      await update($, running, r => (r ? { ...r, effort } : r))
+      await recompute($).catch(note)
+    }
+    return done
+  })
+
+  // A settings file changed (the effort among them): read the picker and the effort again now.
+  on('classic.ConfigChange', async ($, e, next) => {
+    const done = await next(e)
+    void follow($).catch(note)
+    return done
   })
 
   on('prompt.edit', async ($, e, next) => {
@@ -460,18 +629,26 @@ export const register: Register = on => {
   })
 
   on('prompt.submit', async ($, e, next) => {
-    lastSent = e.text
     draft = ''
+    void recompute($).catch(note)
     return next(e)
   })
 
+  // A finished turn is one message: its tokens join the last few, averaged.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+    const mix = e.agentId === undefined ? turnMix.get(e.turnId) : undefined
+    turnMix.delete(e.turnId)
+    if (mix) {
+      recent = [...recent, mix].slice(-RECENT)
+      const avg = (k: keyof Mix) => recent.reduce((a, m) => a + m[k], 0) / recent.length
+      await update($, perMessage, () => ({ input: avg('input'), output: avg('output'), cacheRead: avg('cacheRead'), cacheWrite: avg('cacheWrite') }))
+    }
     await recompute($).catch(note)
     return done
   })
 
-  // Says what the mod sees, to check the Use button can work here.
+  // Says what the mod sees: the model in use, the chat's tokens per message, any error.
   on('command.run', { command: 'model-hint' }, async $ => {
     const rows = await $.config.list().catch(err => {
       lastError = `config: ${err instanceof Error ? err.message : String(err)}`
@@ -484,10 +661,15 @@ export const register: Register = on => {
         `session model: ${await $.session.model().catch(() => 'unknown')}`,
         `model row: ${show(find(rows, /^model$|\bmodel\b/i))}`,
         `effort row: ${show(find(rows, /effort/i))}`,
-        `draft seen: ${JSON.stringify(draft.slice(0, 60))} · last sent: ${JSON.stringify(lastSent.slice(0, 60))}`,
+        `draft seen: ${JSON.stringify(draft.slice(0, 60))}`,
         `judged by: ${await read($, mode)}`,
-        `switched here to: ${(c => (c === null ? 'nothing (the app picks)' : `${TIERS[c]!.name} · ${TIERS[c]!.effort}`))(await read($, chosen))}`,
-        `last request went out on: ${(l => (l ? `${l.model} · ${l.effort ?? 'no effort'}` : 'none yet'))(await read($, sent))}`,
+        `running on: ${(l => (l ? `${l.model} · ${l.effort ?? 'effort not reported'}` : 'unknown'))(await read($, running))}`,
+        `picker (desktop record): ${desktopFile ? `${desktopPick?.model ?? 'model not set'} · ${desktopPick?.effort ?? 'effort not set'} · ${desktopFile}` : 'not found'}`,
+        `billing: ${planSeen ? 'plan (usage limits)' : `credits (${identityKind ?? 'unknown login'})`} · cache lifetime: ${reportedTtl ?? `${planSeen ? '1h' : '5m'} (assumed)`}`,
+        `models with a warm cache: ${[...warm].map(([f, w]) => `${f} ${kTokens(w.tokens)}`).join(', ') || 'none yet'}`,
+        `band fit: ${lastFit ? `${lastFit.rows} of ${lastFit.maxRows} rows, ${lastFit.bodyColumns} columns` : 'not drawn yet'}`,
+        `effort change re-reads the cache: ${effortBreaksCache === null ? 'not seen yet' : effortBreaksCache ? 'yes' : 'no'}`,
+        `tokens per message: ${(m => (m ? `${Math.round(m.input)} in · ${Math.round(m.output)} out · ${Math.round(m.cacheRead)} cache read · ${Math.round(m.cacheWrite)} cache write` : 'not measured yet'))(await read($, perMessage))}`,
         `last error: ${lastError || 'none'}`,
       ].join('\n'),
     }
@@ -499,7 +681,6 @@ export const register: Register = on => {
     const below = await next(e)
     if (e.surface !== 'desktop' || e.props.hasSurvey) return below
     const s = await read($, suggestion)
-    const isConfirming = await read($, confirming)
     const { Box, Button, Svg, Text } = $.ui.resolve(e)
     const stack = (row: RenderElement) =>
       below ? (
@@ -511,10 +692,6 @@ export const register: Register = on => {
         row
       )
     const by = await read($, mode)
-    // Flips how the prompt is judged; the band says which judged this one.
-    // An action: its mark, then its words, all one control. A Button holds text alone, so its
-    // label starts with room for the mark, and the mark is laid over that room; a placed Box
-    // passes the pointer through, so a press on the mark lands on the Button beneath.
     // An action: its mark, then its words, with the model row's gap between. The words are the
     // control: a Button holds text alone, draws it in its own weight, and a placed Box laid over
     // it would take the press itself, so the mark sits beside the Button, not on it.
@@ -541,13 +718,15 @@ export const register: Register = on => {
     const isFolded = rowsShown === 0
     // What the title row says while folded: the pick in a line. Set below once there is one.
     let summary = 'type a prompt for a suggestion'
-    // The title row: the name with Hide or Show right beside it, then the summary while folded.
+    // The title row: the name with Hide or Show right beside it, then how prompts are judged (the
+    // switch, a row of its own no more: the band fits in fewer rows), then the summary while folded.
     const title = () => (
       <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
         <Box flexShrink={0} flexDirection="row" alignItems="center" gap="md">
           <Text bold>Model hints</Text>
           <Button key="fold" plain dimColor label={isHidden ? 'Show' : 'Hide'} onPress={() => void fold($, !isHidden).catch(note)} />
         </Box>
+        {toggle}
         <Box flexGrow={1} flexShrink={1}>
           {isFolded ? <Text dimColor>{summary}</Text> : null}
         </Box>
@@ -594,21 +773,45 @@ export const register: Register = on => {
         {body}
       </Box>
     )
-    const judgedRow = labelled('Judged by', toggle)
     if (!s) {
-      return stack(section(isThinking ? 'thinking' : 'sleepy', labelled('Model', <Text dimColor>type a prompt for a suggestion</Text>), judgedRow))
+      return stack(section(isThinking ? 'thinking' : 'sleepy', labelled('Model', <Text dimColor>type a prompt for a suggestion</Text>)))
+    }
+    // The Model row: the model's mark and name, then its effort as the gauge and the word, when known;
+    // after them, dim, anything the row adds. Each in its fixed slot, so nothing slides.
+    const modelRow = (name: string, effort: string | null, after: string | null = null) => (
+      <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
+        <Box width={LABEL_WIDTH} flexShrink={0}>
+          <Text dimColor>Model</Text>
+        </Box>
+        <Box width={NAME_WIDTH} flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
+          <Svg source={spark()} width={14} height={14} alt={name} />
+          <Text bold>{name}</Text>
+        </Box>
+        <Box width={EFFORT_WIDTH} flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
+          {effort !== null && LEVELS.includes(effort) ? (
+            <Svg source={gauge(effort)} width={GAUGE_W} height={14} alt={`${effort} effort`} />
+          ) : null}
+          {effort !== null && LEVELS.includes(effort) ? <Text dimColor>{levelName(effort)}</Text> : null}
+        </Box>
+        <Box flexGrow={1} flexShrink={1} flexDirection="row" justifyContent="center">
+          {after ? <Text dimColor>{after}</Text> : null}
+        </Box>
+      </Box>
+    )
+    // An empty prompt box: the model the chat runs now, read live (the footer's picker moves it at
+    // once), asleep until there's a prompt to judge.
+    if (s.idle) {
+      const run = (await read($, running)) ?? s.current
+      const nowOn = TIERS.find(x => run.model.toLowerCase().includes(x.family))?.name
+      const effort = run.effort?.toLowerCase() ?? null
+      if (!nowOn) {
+        return stack(section(isThinking ? 'thinking' : 'sleepy', labelled('Model', <Text dimColor>type a prompt for a suggestion</Text>)))
+      }
+      summary = effort && LEVELS.includes(effort) ? `${nowOn} · ${effort}` : nowOn
+      return stack(section(isThinking ? 'thinking' : 'sleepy', modelRow(nowOn, effort, 'type a prompt for a suggestion')))
     }
     const t = TIERS[s.tier]!
-    // The effort is the app's to show where no setting reports it: then the model alone decides.
-    const fits =
-      s.current.model.toLowerCase().includes(t.family) &&
-      (s.current.effort === null || s.current.effort.toLowerCase() === t.effort)
-    const switchable = s.canApply && !fits
-    const reread = switchable && s.contextTokens >= REREAD_WARN
-    const warnings = [
-      ...s.warnings,
-      ...(reread ? [`A switch starts a fresh cache, so your next message re-reads ${kTokens(s.contextTokens)} tokens once.`] : []),
-    ]
+    const warnings = s.warnings
     const reasons = [...s.reasons, ...(s.source === 'rules-fallback' ? ["Haiku didn't answer, judged by rules"] : [])]
     // A line beside the label column: the label (or nothing) and text that wraps rather than cuts.
     const line = (label: RenderElement | null, body: RenderElement) => (
@@ -626,71 +829,63 @@ export const register: Register = on => {
     const warningLine = warnings.length
       ? line(alertLabel('Good to know'), <Text>{warnings.join('  ')}</Text>)
       : null
-    // What the session runs now, said in words beside the suggestion: in use, or what it is instead.
+    // The model the chat runs now: the footer's picker shows it, so the band only names it in the
+    // savings it works out against it.
     const nowOn = TIERS.find(x => s.current.model.toLowerCase().includes(x.family))?.name
-    const status = fits ? (
-      <Text>{s.switched ? 'in use · switched here' : 'in use'}</Text>
-    ) : nowOn ? (
-      <Text dimColor>{`you're on ${nowOn}`}</Text>
-    ) : null
     // The reason leads, named for who gave it: Haiku's read of the prompt, or the word rules'.
     const reasonLine = line(
       <Text dimColor>{s.source === 'haiku' ? "Haiku's take" : 'Reason'}</Text>,
       <Text>{reasons.join('   ·   ')}</Text>,
     )
+    // What the pick would save or cost against the model the chat runs on, on its own messages, and
+    // what moving costs once: in shares of usage for a plan, in dollars at API prices for credits.
+    // The person switches in the footer's picker; the band only advises.
+    const c = s.compare
+    const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
+    const altT = s.alt !== null ? TIERS[s.alt] : undefined
+    const other = altT ?? t
+    // One line where it can: what to do, the saving a message, and the one-off re-read with the
+    // messages it takes to repay. Shares of usage on a plan; dollars at API prices on credits.
+    const pct = (x: NonNullable<typeof c>) => `${Math.round((Math.abs(x.saving) / x.here) * 100)}%`
+    const dollarsEach = (x: NonNullable<typeof c>) => (s.billing === 'plan' ? '' : ` (${dollars(x.there)} vs ${dollars(x.here)})`)
+    const rereadOf = (x: NonNullable<typeof c>) =>
+      x.warmMinutes !== null ? `${kTokens(x.lacks)} re-read (${other.name} cached ${x.warmMinutes} min ago)` : `${kTokens(s.contextTokens)} re-read`
+    const once = (x: NonNullable<typeof c>) =>
+      s.billing === 'plan'
+        ? x.switchCost < x.here
+          ? 'under a message'
+          : `≈ ${plural(Math.round(x.switchCost / x.here), 'message')}`
+        : dollars(x.switchCost)
+    const estimate = c?.isEstimate ? ' (estimate)' : ''
+    const savingsText = !c
+      ? null
+      : s.advice === 'switch'
+        ? `Switch to ${t.name}: ${pct(c)} less ${s.billing === 'plan' ? 'usage ' : ''}a message${dollarsEach(c)}. The ${rereadOf(c)} costs ${once(c)}, repaid in ${plural(c.breakEven ?? 1, 'message')}.${estimate}`
+        : s.advice === 'stay'
+          ? `Stay on ${nowOn}. ${other.name} saves ${pct(c)} a message${dollarsEach(c)}, but its ${rereadOf(c)} takes ${plural(c.breakEven ?? 0, 'message')} to repay; a new chat avoids it.${estimate}`
+          : `${t.name} needed: ${(c.there / c.here).toFixed(1)}× the ${s.billing === 'plan' ? 'usage' : 'cost'} a message${dollarsEach(c)}. The ${rereadOf(c)} costs ${once(c)}.${estimate}`
+    // An effort the picker should change, said beside the model where there's room.
+    const effortHint =
+      s.current.effort && s.current.effort.toLowerCase() !== t.effort
+        ? `pick ${levelName(t.effort)} in the picker${effortBreaksCache ? ' (re-reads too)' : ''}`
+        : null
+    const savingsLine = savingsText ? line(<Text dimColor>Cost</Text>, <Text>{savingsText}</Text>) : null
     // Top: the warnings when any, then why. Then one row read left to right: the label, the
     // suggested model and its effort, whether it's in use, and the actions at the end.
-    summary = `${t.name} · ${t.effort} · ${fits ? 'in use' : nowOn ? `you're on ${nowOn}` : 'suggested'}`
-    const mood: Mood = isThinking ? 'thinking' : !fits ? 'pointing' : warnings.length ? 'puffed' : 'happy'
-    const view = section(
-      mood,
-      warningLine,
-      reasonLine,
-      judgedRow,
-      <Box flexDirection="row" alignItems="center" width="100%" gap="lg">
-        <Box width={LABEL_WIDTH} flexShrink={0}>
-          <Text dimColor>Model</Text>
-        </Box>
-        <Box width={NAME_WIDTH} flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
-          <Svg source={spark()} width={14} height={14} alt={t.name} />
-          <Text bold>{t.name}</Text>
-        </Box>
-        <Box width={EFFORT_WIDTH} flexShrink={0} flexDirection="row" alignItems="center" gap="sm">
-          <Svg source={gauge(t.effort)} width={18} height={14} alt={`${t.effort} effort`} />
-          <Text dimColor>{t.effort}</Text>
-        </Box>
-        <Box width={STATUS_WIDTH} flexShrink={0}>
-          {status}
-        </Box>
-        <Box flexGrow={1} />
-        {/* Use is drawn plain, as the switch is, so the row keeps one height; its slot stays when empty. */}
-        <Box width={USE_WIDTH} flexShrink={0} flexDirection="row" justifyContent="flex-end">
-          {switchable
-            ? action(GO, `Switch to ${t.name}`, 'use', `Use ${t.name}`, () => void use($, s).catch(note))
-            : s.switched
-              ? action(SWAP, "Back to the app's pick", 'reset', 'Reset', () => void reset($).catch(note))
-              : null}
-        </Box>
-      </Box>,
-    )
-    // Asked before a switch that re-reads a large conversation: what it costs, then go or stay.
-    const confirm = section(
-      'curious',
-      line(
-        alertLabel('Switching'),
-        <Text>
-          {`Moving to ${t.name} re-reads this conversation's ${kTokens(s.contextTokens)} tokens uncached on the next turn, about 12× what those tokens cost on a cached turn. Later turns are cached again.`}
-        </Text>,
-      ),
-      line(
-        null,
-        <Box flexDirection="row" alignItems="center" gap="sm">
-          <Button key="switch" variant="primary" label={`Switch to ${t.name}`} onPress={() => void apply($, s.tier).catch(note)} />
-          <Button key="keep" label="Keep current" onPress={() => void update($, confirming, () => false).catch(note)} />
-        </Box>,
-      ),
-    )
-    if (isConfirming && switchable) return stack(confirm)
+    summary = `${t.name} · ${t.effort}`
+    const mood: Mood = isThinking ? 'thinking' : s.advice === 'switch' || s.advice === 'upgrade' ? 'pointing' : warnings.length ? 'puffed' : 'happy'
+    // The band shows whole only within the rows the app gives it; past that it scrolls. So the
+    // rows it can spare go first while it wouldn't fit: the note, then the reason.
+    const textCols = Math.max(20, e.props.bodyColumns - LABEL_WIDTH - 4 - AVATAR_CLEAR)
+    const rowsOf = (text: string | null) => (text ? Math.max(1, Math.ceil(text.length / textCols)) : 0)
+    const belowRows = below ? 3 : 0
+    let optional: { note: RenderElement | null; reason: RenderElement | null } = { note: warningLine, reason: reasonLine }
+    const tall = () =>
+      1 + (optional.note ? rowsOf(warnings.join('  ')) : 0) + (optional.reason ? rowsOf(reasons.join('   ·   ')) : 0) + rowsOf(savingsText) + 1 + belowRows
+    if (tall() > e.props.maxRows) optional = { ...optional, note: null }
+    if (tall() > e.props.maxRows) optional = { ...optional, reason: null }
+    lastFit = { maxRows: e.props.maxRows, bodyColumns: e.props.bodyColumns, rows: tall() }
+    const view = section(mood, optional.note, optional.reason, savingsLine, modelRow(t.name, t.effort, effortHint))
     return stack(view)
   })
 }

@@ -58,15 +58,91 @@ const until = (iso: string | null, now: number) => {
   return h > 0 ? `resets in ${h}h ${m}m` : `resets in ${m}m`
 }
 
-// Takes a fresh reading; keeps the last one (with a new clock time) when the engine has none right now.
-// The engine's figures are the last API response's, so once the reset time passes they describe a
-// window that is over: a new one starts empty until the next response says otherwise.
-const refresh = async ($: EngineInterface) => {
-  const { rateLimits } = await $.session.usage()
-  const five = rateLimits.find(r => r.kind === 'five_hour')
+const FIVE_HOURS = 5 * 3_600_000
+
+// The live figures: Anthropic's own count, the one the app's usage popup shows, asked with the
+// session's sign-in (the engine holds the secret and sets the header). Off a plan there is none.
+const USAGE_URL = 'https://api.anthropic.com/api/oauth/usage'
+// How often to ask: every half minute while idle, every 10 seconds while replies come in. A
+// failed ask waits 5 minutes before the next.
+const LIVE_IDLE = 30_000
+const LIVE_BUSY = 10_000
+const LIVE_RETRY = 300_000
+let live: LimitReading | null = null
+let liveAskedAt = 0
+let liveRetryAt = 0
+let asking = false
+// What the last reading came from and the last failure, for /limit-hint.
+let source = 'none yet'
+let lastError = ''
+const note = (err: unknown) => {
+  lastError = err instanceof Error ? err.message : String(err)
+}
+
+const askLive = async ($: EngineInterface, at: number): Promise<LimitReading | null> => {
+  const auth = await $.session.authorize()
+  if (!auth || auth.kind !== 'bearer') return null
+  const res = await $.http.fetch(USAGE_URL, { auth: auth.handle, headers: { 'anthropic-beta': 'oauth-2025-04-20' } })
+  if (!res.ok) throw new Error(`usage request: HTTP ${res.status}`)
+  const five = (JSON.parse(res.text) as { five_hour?: { utilization?: unknown; resets_at?: unknown } | null }).five_hour
+  if (!five || typeof five.utilization !== 'number') return null
+  return { used: Math.round(five.utilization * 10) / 10, resetsAt: typeof five.resets_at === 'string' ? five.resets_at : null, at }
+}
+
+// The desktop app's own record of the plan's usage: a sample every 15 minutes, whichever chat
+// or device spent it. Only a sample taken inside the current window counts.
+const SAMPLE_FILES = ['.config/Claude/plan-usage-history.json', 'Library/Application Support/Claude/plan-usage-history.json']
+const lastSample = async ($: EngineInterface) => {
+  const home = $.plugin.root.split(/\/\.claude\/|\/\.config\/|\/Library\//)[0]
+  for (const f of SAMPLE_FILES) {
+    const text = await $.fs.read(`${home}/${f}`).catch(() => '')
+    if (!text) continue
+    const samples = (JSON.parse(text) as { samples?: { t: number; u?: { fh?: number } }[] }).samples ?? []
+    const s = samples[samples.length - 1]
+    if (s && typeof s.u?.fh === 'number') return { t: s.t, used: s.u.fh }
+  }
+  return null
+}
+
+const sameWindow = (a: string | null, b: string | null) => a != null && b != null && Math.abs(Date.parse(a) - Date.parse(b)) < 10 * 60_000
+
+// Takes a fresh reading. The live count when it can be had; otherwise the engine's figure, which is
+// the last response's and so lags a request behind, raised to the app's latest sample when that
+// is higher. Within one window usage only grows, so a reading never drops below the last one.
+// Once the reset time passes the window is over: a new one starts empty until a reading says otherwise.
+const refresh = async ($: EngineInterface, gap = LIVE_IDLE) => {
   const at = await $.clock.now()
-  const fresh: LimitReading | null = five ? { used: five.percentUsed, resetsAt: five.resetsAt ?? null, at } : null
-  const r = fresh ?? (await read($, reading))
+  if (!asking && at - liveAskedAt >= gap && at >= liveRetryAt) {
+    asking = true
+    liveAskedAt = at
+    try {
+      live = (await askLive($, at)) ?? live
+    } catch (err) {
+      note(err)
+      liveRetryAt = at + LIVE_RETRY
+    } finally {
+      asking = false
+    }
+  }
+  const prev = await read($, reading)
+  let r: LimitReading | null = null
+  if (live && at - live.at < 2 * LIVE_IDLE + 5_000) {
+    r = { ...live, at }
+    source = 'live (Anthropic usage)'
+  } else {
+    const { rateLimits } = await $.session.usage()
+    const five = rateLimits.find(l => l.kind === 'five_hour')
+    const resetsAt = five?.resetsAt ?? prev?.resetsAt ?? null
+    const start = resetsAt ? Date.parse(resetsAt) - FIVE_HOURS : at - 20 * 60_000
+    const sample = await lastSample($).catch(() => null)
+    const counted = sample && sample.t >= start ? sample.used : null
+    if (five || counted != null) {
+      r = { used: Math.max(five?.percentUsed ?? 0, counted ?? 0), resetsAt, at }
+      source = counted != null && counted > (five?.percentUsed ?? -1) ? "the app's last sample" : 'last response'
+    }
+  }
+  if (r && prev && sameWindow(r.resetsAt, prev.resetsAt) && prev.used > r.used) r = { ...r, used: prev.used }
+  r ??= prev
   const over = r?.resetsAt != null && Date.parse(r.resetsAt) <= at
   await update($, reading, () => (r ? (over ? { used: 0, resetsAt: null, at } : { ...r, at }) : null))
 }
@@ -84,25 +160,43 @@ export const register: Register = on => {
       .get('hidden')
       .then(v => update($, hidden, () => v === true))
       .catch(() => {})
-    void refresh($).catch(() => {})
-    // Every 15 seconds: moves the reset countdown, starts the new window on time, and picks up a
-    // reading taken elsewhere. Reading it is local: no request is made.
-    $.clock.every(15_000, () => void refresh($).catch(() => {}))
+    void refresh($).catch(note)
+    // Every 5 seconds: moves the reset countdown, starts the new window on time, and picks up
+    // usage spent elsewhere. The live count is asked for at most every half minute of these.
+    $.clock.every(5_000, () => void refresh($).catch(note))
+    await $.command.register({ name: 'limit-hint', description: 'Show where the 5-hour figure comes from' })
     return next(e)
   })
 
-  // After every model request, mid-turn included: each response reports the limit.
+  // After every model request, mid-turn included: usage just moved, so ask again sooner.
   on('turn.step', async function* ($, e, next) {
     const done = yield* next(e)
-    void refresh($).catch(() => {})
+    void refresh($, LIVE_BUSY).catch(note)
     return done
   })
 
-  // After every reply: the response just reported the limit.
+  // After every reply, and whenever the engine sees a window move.
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
-    await refresh($).catch(() => {})
+    await refresh($, LIVE_BUSY).catch(note)
     return done
+  })
+  on('session.measure', async ($, e, next) => {
+    if (e.changed.includes('rateLimits')) void refresh($, LIVE_BUSY).catch(note)
+    return next(e)
+  })
+
+  on('command.run', { command: 'limit-hint' }, async $ => {
+    const r = await read($, reading)
+    const at = await $.clock.now()
+    return {
+      text: [
+        `5h figure: ${r ? `${r.used}% · ${until(r.resetsAt, at) || 'no reset time'}` : 'none yet'}`,
+        `from: ${source}`,
+        `live count: ${live ? `${live.used}%, ${Math.round((at - live.at) / 1000)}s ago` : 'not had yet'}`,
+        `last error: ${lastError || 'none'}`,
+      ].join('\n'),
+    }
   })
 
   // Desktop app (Code tab): the footer beside the model name only draws a short label,
